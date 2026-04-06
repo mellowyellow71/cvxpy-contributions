@@ -3,6 +3,7 @@
 //! This module provides the SparseTensor type which stores 3D tensor data
 //! in coordinate (COO) format, matching CVXPY's TensorRepresentation.
 
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Constant ID used for non-parametric entries
@@ -366,17 +367,22 @@ pub struct BuildMatrixResult {
 }
 
 impl BuildMatrixResult {
-    /// Create from a SparseTensor by flattening the 3D structure to 2D
+    /// Create from a SparseTensor by flattening the 3D structure to 2D.
     ///
     /// The output matrix has shape (total_rows * (var_length + 1), param_size_plus_one)
     /// where the tensor is flattened in column-major (Fortran) order.
+    ///
+    /// Entries are sorted by flat_row before returning so that numpy.unique
+    /// in reduce_problem_data_tensor gets a pre-sorted array and runs in O(n)
+    /// (timsort on sorted input) rather than O(n log n).
     pub fn from_tensor(tensor: SparseTensor, num_param_slices: usize) -> Self {
         let (n_rows, n_cols) = tensor.shape;
         let output_rows = n_rows * n_cols;
         let output_cols = num_param_slices;
 
-        // Convert 3D COO to 2D COO
-        // Output row = col * n_rows + row (column-major flattening)
+        let nnz = tensor.data.len();
+
+        // Compute flat_row = col * n_rows + row for each entry
         let flat_rows: Vec<i64> = tensor
             .rows
             .iter()
@@ -384,10 +390,20 @@ impl BuildMatrixResult {
             .map(|(&r, &c)| c * (n_rows as i64) + r)
             .collect();
 
+        // Build a sorted permutation index by flat_row.
+        // Using parallel sort via rayon — faster than numpy's sort for large arrays.
+        let mut order: Vec<usize> = (0..nnz).collect();
+        order.par_sort_unstable_by_key(|&i| flat_rows[i]);
+
+        // Apply the permutation to all arrays
+        let sorted_rows: Vec<i64> = order.iter().map(|&i| flat_rows[i]).collect();
+        let sorted_data: Vec<f64> = order.iter().map(|&i| tensor.data[i]).collect();
+        let sorted_cols: Vec<i64> = order.iter().map(|&i| tensor.param_offsets[i]).collect();
+
         BuildMatrixResult {
-            data: tensor.data,
-            rows: flat_rows,
-            cols: tensor.param_offsets,
+            data: sorted_data,
+            rows: sorted_rows,
+            cols: sorted_cols,
             shape: (output_rows, output_cols),
         }
     }

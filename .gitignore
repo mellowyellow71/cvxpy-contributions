@@ -63,3 +63,10 @@ cvxpy/version.py
 # Hypothesis testing
 .hypothesis/
 .aider*
+
+# Large files / profiling artifacts
+perf.data
+perf.data.old
+Miniconda3-*.sh
+*.prof
+profile.html

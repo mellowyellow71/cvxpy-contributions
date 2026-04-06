@@ -6,7 +6,7 @@
 #![allow(non_snake_case)]
 
 use super::{process_linop, ProcessingContext};
-use crate::linop::{LinOp, LinOpData};
+use crate::linop::{LinOp, LinOpData, OpType};
 use crate::tensor::SparseTensor;
 use std::sync::Arc;
 
@@ -39,6 +39,16 @@ pub fn process_mul(lin_op: &LinOp, ctx: &ProcessingContext) -> SparseTensor {
         LinOpData::LinOpRef(inner) => inner.as_ref(),
         _ => panic!("Mul operation must have LinOp data"),
     };
+
+    // Fast path: Mul(ConstantMatrix, Variable) — the Jacobian of A @ x is just A.
+    // Skip building the identity tensor and doing A @ I; directly remap A's column
+    // indices to the variable's column offset. Zero multiplications required.
+    if !is_parametric(lhs_linop) {
+        if let Some(var_id) = as_plain_variable(&lin_op.args[0]) {
+            let lhs_data = get_constant_matrix_data(lhs_linop, Some(ctx));
+            return mul_const_by_variable(lhs_data, var_id, lin_op, ctx);
+        }
+    }
 
     // Process the argument (rhs)
     let rhs = process_linop(&lin_op.args[0], ctx);
@@ -608,6 +618,121 @@ enum ConstantMatrix {
         rows: usize,
         cols: usize,
     },
+}
+
+/// Returns Some(var_id) if this LinOp is a plain variable, possibly wrapped
+/// in Reshape or single-arg Sum nodes (which are no-ops in COO format).
+fn as_plain_variable(lin_op: &LinOp) -> Option<i64> {
+    match lin_op.op_type {
+        OpType::Variable => {
+            if let LinOpData::Int(id) = lin_op.data {
+                Some(id)
+            } else {
+                None
+            }
+        }
+        // Reshape and single-arg Sum are no-ops in COO format — unwrap and recurse
+        OpType::Reshape => {
+            if lin_op.args.len() == 1 {
+                as_plain_variable(&lin_op.args[0])
+            } else {
+                None
+            }
+        }
+        OpType::Sum => {
+            if lin_op.args.len() == 1 {
+                as_plain_variable(&lin_op.args[0])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Fast path for Mul(ConstantMatrix, Variable).
+///
+/// The Jacobian of f(x) = A @ x with respect to x is just A. Rather than
+/// building an identity tensor for x and doing A @ I (n*m scalar multiplies),
+/// we directly remap A's column indices to the variable's column offset.
+///
+/// Cost: O(nnz(A)) — a single pass over A's data with index arithmetic only.
+fn mul_const_by_variable(
+    lhs: ConstantMatrix,
+    var_id: i64,
+    lin_op: &LinOp,
+    ctx: &ProcessingContext,
+) -> SparseTensor {
+    let output_rows = lin_op.size();
+    let var_col_offset = ctx.var_col(var_id);
+    let param_offset = ctx.const_param();
+    let out_shape = (output_rows, ctx.var_length as usize + 1);
+
+    match lhs {
+        ConstantMatrix::Scalar(s) => {
+            // Scalar * variable: scaled identity, one entry per variable element
+            let n = lin_op.args[0].size();
+            let mut result = SparseTensor::with_capacity(out_shape, n);
+            if s != 0.0 {
+                for i in 0..n {
+                    result.push(s, i as i64, var_col_offset + i as i64, param_offset);
+                }
+            }
+            result
+        }
+
+        ConstantMatrix::DenseColMajor { data, rows: a_rows, cols: a_cols } => {
+            // data is in column-major layout: data[col * a_rows + row] = A[row, col]
+            // Map each nonzero A[row, col] → output (row, var_col_offset + col, val)
+            let nnz_estimate = data.iter().filter(|&&v| v != 0.0).count();
+            let mut result = SparseTensor::with_capacity(out_shape, nnz_estimate);
+            for col in 0..a_cols {
+                let out_col = var_col_offset + col as i64;
+                let col_start = col * a_rows;
+                for row in 0..a_rows {
+                    let val = data[col_start + row];
+                    if val != 0.0 {
+                        result.push(val, row as i64, out_col, param_offset);
+                    }
+                }
+            }
+            result
+        }
+
+        ConstantMatrix::DenseRowMajor { data, rows: a_rows, cols: a_cols } => {
+            // data is in row-major layout: data[row * a_cols + col] = A[row, col]
+            // Used for 1D arrays treated as row vectors (a_rows == 1 typically)
+            let nnz_estimate = data.iter().filter(|&&v| v != 0.0).count();
+            let mut result = SparseTensor::with_capacity(out_shape, nnz_estimate);
+            for row in 0..a_rows {
+                for col in 0..a_cols {
+                    let val = data[row * a_cols + col];
+                    if val != 0.0 {
+                        let out_col = var_col_offset + col as i64;
+                        result.push(val, row as i64, out_col, param_offset);
+                    }
+                }
+            }
+            result
+        }
+
+        ConstantMatrix::Sparse { values, row_indices, col_indptr, rows: _, cols: a_cols } => {
+            // CSC sparse: iterate columns then nonzeros within each column
+            let mut result = SparseTensor::with_capacity(out_shape, values.len());
+            for col in 0..a_cols {
+                let out_col = var_col_offset + col as i64;
+                let start = col_indptr[col] as usize;
+                let end = col_indptr[col + 1] as usize;
+                for idx in start..end {
+                    let val = values[idx];
+                    if val != 0.0 {
+                        result.push(val, row_indices[idx], out_col, param_offset);
+                    }
+                }
+            }
+            result
+        }
+    }
 }
 
 /// Block diagonal multiplication from left: kron(I, A) @ tensor
