@@ -1,0 +1,51 @@
+name: Sync from fork
+
+on:
+  schedule:
+    - cron: '23 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "ray"
+          git config user.email "rayk99801@gmail.com"
+
+      - name: Sync from source and strip inherited CI
+        run: |
+          PREV_TREE=$(git rev-parse HEAD^{tree})
+
+          git remote add source https://github.com/mellowyellow71/cvxpy.git
+          git fetch source ray/vibe-rust
+
+          cp .github/workflows/sync.yml /tmp/sync.yml
+          git reset --hard source/ray/vibe-rust
+
+          rm -rf .github
+          mkdir -p .github/workflows
+          cp /tmp/sync.yml .github/workflows/sync.yml
+
+          git add -A
+          NEW_TREE=$(git write-tree)
+
+          if [ "$NEW_TREE" = "$PREV_TREE" ]; then
+            echo "No upstream changes; nothing to push."
+            exit 0
+          fi
+
+          git commit -m "Sync from fork"
+          git push --force-with-lease origin main
