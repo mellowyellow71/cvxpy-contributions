@@ -8,6 +8,7 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::useless_conversion)] // False positives from PyO3 macro expansion
 
+mod block;
 mod linop;
 mod matrix_builder;
 mod operations;

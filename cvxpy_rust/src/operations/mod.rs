@@ -8,6 +8,7 @@ mod leaf;
 mod specialized;
 mod structural;
 
+use crate::block::NodeValue;
 use crate::linop::{LinOp, OpType};
 use crate::tensor::SparseTensor;
 use std::collections::HashMap;
@@ -119,4 +120,30 @@ fn process_reshape(lin_op: &LinOp, ctx: &ProcessingContext) -> SparseTensor {
 
     // Reshape is a NOOP in COO format - the row indices already encode position
     process_linop(&lin_op.args[0], ctx)
+}
+
+/// Block-IR-aware variant of `process_linop`.
+///
+/// Returns a typed `NodeValue` for handlers that have been migrated to the
+/// Block IR (currently: leaves), and wraps the legacy COO output of all other
+/// handlers as a single `Block::Coo` contribution. Behaviourally equivalent to
+/// `process_linop`; the caller can use the typed structure if present (e.g.,
+/// to dispatch a Mul fast path) or just call `.to_coo()` for the flat path.
+///
+/// This is the entry point future Block-aware handlers will recurse into
+/// instead of `process_linop`.
+#[allow(dead_code)] // Wired into handlers in upcoming PRs.
+pub fn process_linop_block(lin_op: &LinOp, ctx: &ProcessingContext) -> NodeValue {
+    match lin_op.op_type {
+        OpType::Variable => leaf::process_variable_block(lin_op, ctx),
+        OpType::ScalarConst => leaf::process_scalar_const_block(lin_op, ctx),
+        OpType::DenseConst => leaf::process_dense_const_block(lin_op, ctx),
+        OpType::SparseConst => leaf::process_sparse_const_block(lin_op, ctx),
+        OpType::Param => leaf::process_param_block(lin_op, ctx),
+
+        // All other handlers still produce a flat SparseTensor; wrap it as a
+        // single COO contribution. Migrating these progressively is the work
+        // of subsequent PRs (Mul/Neg, then structural, then specialized).
+        _ => NodeValue::from_coo(process_linop(lin_op, ctx)),
+    }
 }
